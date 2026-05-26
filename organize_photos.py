@@ -13,6 +13,7 @@ import math
 import argparse
 import logging
 import shutil
+import json
 from datetime import datetime
 
 from PIL import Image
@@ -178,21 +179,53 @@ def haversine_meters(lat1, lon1, lat2, lon2):
     return R * c
 
 
-def find_photos(directory, exts=None):
+def load_progress(state_file):
+    """Load processed file paths and completed clusters from state file."""
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r") as f:
+                state = json.load(f)
+                return set(state.get("processed_files", [])), state.get("completed_clusters", 0)
+        except Exception as e:
+            logging.warning("Failed to load state from %s: %s", state_file, e)
+            return set(), 0
+    return set(), 0
+
+
+def save_progress(state_file, processed_files, completed_clusters):
+    """Save processed file paths and completed cluster count to state file."""
+    try:
+        state = {
+            "processed_files": list(processed_files),
+            "completed_clusters": completed_clusters,
+            "last_updated": datetime.now().isoformat()
+        }
+        with open(state_file, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logging.warning("Failed to save state to %s: %s", state_file, e)
+
+
+def find_photos(directory, exts=None, exclude_files=None):
+    """Find photo files, optionally excluding already-processed ones."""
     if exts is None:
         exts = {".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".heic", ".HEIC"}
     else:
         exts = set(e.lower() for e in exts)
+    if exclude_files is None:
+        exclude_files = set()
     files = []
     for root, _, filenames in os.walk(directory):
         for fname in filenames:
             _, ext = os.path.splitext(fname)
             if ext.lower() in exts:
-                files.append(os.path.join(root, fname))
+                full_path = os.path.join(root, fname)
+                if full_path not in exclude_files:
+                    files.append(full_path)
     return files
 
-def cluster_photos(directory, time_threshold_hours=3.0, dist_threshold_m=1000.0):
-    files = find_photos(directory)
+def cluster_photos(directory, time_threshold_hours=3.0, dist_threshold_m=1000.0, exclude_files=None):
+    files = find_photos(directory, exclude_files=exclude_files)
     photos = []
     undated = []
     for f in files:
@@ -406,15 +439,25 @@ def ask_llava_for_album_name(sample_paths, model="llava", max_images=3, host=Non
         return "Unnamed_Event"
 
 
-def organize(directory, time_threshold_hours, dist_threshold_m, max_samples, model, host, copy_files=True, dry_run=False, use_ai=True):
-    clusters, undated = cluster_photos(directory, time_threshold_hours, dist_threshold_m)
-    print(f"Detected {len(clusters)} event clusters.")
+def organize(directory, time_threshold_hours, dist_threshold_m, max_samples, model, host, copy_files=True, dry_run=False, use_ai=True, state_file=None, batch_size=None):
+    # Load progress state
+    processed_files, completed_clusters = load_progress(state_file) if state_file else (set(), 0)
+    
+    if processed_files:
+        print(f"Resuming from previous run. Already processed {len(processed_files)} files, {completed_clusters} clusters completed.")
+    
+    clusters, undated = cluster_photos(directory, time_threshold_hours, dist_threshold_m, exclude_files=processed_files)
+    print(f"Detected {len(clusters)} pending event clusters.")
     if undated:
         print(f"Detected {len(undated)} undated photos (no EXIF timestamp); these will be placed in 'Unknown_Date' and will not be sent to AI.")
     target_root = os.path.join(directory, "Organized_Albums")
     os.makedirs(target_root, exist_ok=True)
-
-    for idx, cluster in enumerate(clusters, start=1):
+    
+    # Limit to batch_size if specified
+    clusters_to_process = clusters[:batch_size] if batch_size else clusters
+    total_clusters = len(clusters)
+    
+    for idx, cluster in enumerate(clusters_to_process, start=completed_clusters + 1):
         sample_paths = [p["path"] for p in cluster[:max_samples]]
         date_str = cluster[0]["datetime"].strftime("%Y-%m-%d")
 
@@ -424,7 +467,7 @@ def organize(directory, time_threshold_hours, dist_threshold_m, max_samples, mod
             ai_title = f"Event_{idx}"
 
         final_album_name = f"{date_str} - {ai_title}"
-        print(f"\nProcessing Album {idx}/{len(clusters)} ({len(cluster)} photos): {final_album_name}")
+        print(f"\nProcessing Album {idx}/{total_clusters} ({len(cluster)} photos): {final_album_name}")
 
         target_folder = os.path.join(target_root, final_album_name)
         if dry_run:
@@ -432,6 +475,7 @@ def organize(directory, time_threshold_hours, dist_threshold_m, max_samples, mod
             continue
         os.makedirs(target_folder, exist_ok=True)
 
+        cluster_processed = True
         for p in cluster:
             try:
                 dest = os.path.join(target_folder, os.path.basename(p["path"]))
@@ -439,8 +483,14 @@ def organize(directory, time_threshold_hours, dist_threshold_m, max_samples, mod
                     shutil.copy2(p["path"], dest)
                 else:
                     shutil.move(p["path"], dest)
+                processed_files.add(p["path"])
             except Exception as e:
                 logging.warning("Failed to copy/move %s: %s", p["path"], e)
+                cluster_processed = False
+        
+        # Save progress after each cluster
+        if state_file and cluster_processed:
+            save_progress(state_file, processed_files, idx)
 
     # Handle undated photos: place in Unknown_Date album and skip AI labeling
     if undated:
@@ -460,10 +510,23 @@ def organize(directory, time_threshold_hours, dist_threshold_m, max_samples, mod
                         shutil.copy2(u["path"], dest)
                     else:
                         shutil.move(u["path"], dest)
+                    processed_files.add(u["path"])
                 except Exception as e:
                     logging.warning("Failed to copy/move undated %s: %s", u["path"], e)
+            # Save final state
+            if state_file:
+                save_progress(state_file, processed_files, len(clusters))
 
-    print("\nPhoto organization complete. Check the 'Organized_Albums' folder.")
+    if batch_size and len(clusters) > batch_size:
+        remaining = len(clusters) - batch_size
+        print(f"\n[BATCH COMPLETE] Processed {batch_size} of {total_clusters} clusters.")
+        print(f"Run the script again to process {remaining} remaining clusters.")
+    else:
+        print("\nPhoto organization complete. Check the 'Organized_Albums' folder.")
+        # Clean up state file if all clusters are done
+        if state_file and os.path.exists(state_file):
+            os.remove(state_file)
+            print("Progress state cleared.")
 
 
 def parse_args():
@@ -478,6 +541,8 @@ def parse_args():
     p.add_argument("--dry-run", action="store_true", help="Show actions without creating folders")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
     p.add_argument("--no-ai", action="store_true", help="Skip AI labeling (use simple titles)")
+    p.add_argument("--batch-size", type=int, default=None, help="Process only N clusters per run (enables batch mode)")
+    p.add_argument("--state-file", default=None, help="Path to progress state file (default: <dir>/.organize_state.json)")
     return p.parse_args()
 
 
@@ -485,6 +550,10 @@ if __name__ == "__main__":
     args = parse_args()
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
+    
+    # Default state file location
+    state_file = args.state_file or os.path.join(args.dir, ".organize_state.json")
+    
     organize(
         args.dir,
         args.time_hours,
@@ -495,5 +564,7 @@ if __name__ == "__main__":
         copy_files=not args.move,
         dry_run=args.dry_run,
         use_ai=(not args.no_ai),
+        state_file=state_file,
+        batch_size=args.batch_size,
     )
 
